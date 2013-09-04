@@ -52,7 +52,7 @@ _CABAL_FILE = "traderlib.cabal" -- name of its cabal file
 _TAGS_FILES :: [String]; _TAGS_ROOT, _TAGS_SCAN_DIRS :: String
 _TAGS_FILES = ["../../tags", "../../TAGS"]        -- where to store tags
 _TAGS_ROOT = "../../"                             -- from where to run hasktags
-_TAGS_SCAN_DIRS = "src/trader/src extsrc/haskell" -- what to scan
+_TAGS_SCAN_DIRS = "src/trader/src extsrc/haskell" -- what to scan (from _TAGS_ROOT)
 
 
 
@@ -61,10 +61,7 @@ _TAGS_SCAN_DIRS = "src/trader/src extsrc/haskell" -- what to scan
 -- BuildOptions missing:
 -- - OPTS
 -- - CABAL_OPTS
--- - PROF
 -- - CABALGEN_OPTS
---
--- add hscope
 
 
 
@@ -73,17 +70,20 @@ _TAGS_SCAN_DIRS = "src/trader/src extsrc/haskell" -- what to scan
 data BuildOptions = BuildOptions
     { jobs :: Int
     , oLevel :: Int
+    , prof :: Bool
     } deriving (Eq, Show)
 
 defaultBuildOptions :: BuildOptions
 defaultBuildOptions = BuildOptions
     { jobs = -1 -- set by `nproc`
     , oLevel = 2
+    , prof = False
     }
 
 optDescrs :: [OptDescr (Either String (BuildOptions -> BuildOptions))]
 optDescrs =
     [ Option "O" [] (optional "N"    (\o n -> o{ oLevel = n }) naturalIntArg) "optimization level to pass to GHC via -O"
+    , Option "" ["prof"] (NoArg $ Right (\o -> o{ prof = True })) "enable profiling"
     ]
 
 -- | Helper to create an optional argument.
@@ -178,11 +178,10 @@ main = do
 --
 -- * "Phony actions are intended to define command-line abbreviations.
 --    You should not need phony actions as dependencies of rules [...]."
---   Means: Never `need ["myphony"]`, always `need ["file-needed-in-phony"]`.
---   There is also a bug that actually PREVENTS rebuilding in this case:
---     https://github.com/ndmitchell/shake/issues/55
+--   Means: Never `need ["myphony"]`, always `need ["file-needed-in-phony"]`;
+--   best make a let binding for it.
 rules :: [String] -> BuildOptions -> Rules ()
-rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
+rules targets buildOptions@BuildOptions{ jobs, oLevel, prof } = do
 
     -- Default target
     action $ do
@@ -198,6 +197,13 @@ rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
             else need ["extsrc", "cabalbuild"]
 
 
+    -- Common stamp files
+    let ghcVersion  = "_make/ghc/version"
+        ghcPkgList  = "_make/cabal-dev/pkglist"
+        extsrc      = "_make/extsrc/packages-install-stamp"
+        cabalConfig = "_make/project/setup-config"
+
+
     phony "help" $ do
         liftIO . putStrLn . unlines $
             [ "TODO: This is the help text" ]
@@ -206,7 +212,7 @@ rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
     -- * ENVIRONMENT SECTION
 
     -- GHC version
-    "_make/ghc/version" *> \out -> do
+    ghcVersion *> \out -> do
         alwaysRerun
         Stdout v <- cmd "ghc --numeric-version"
         writeFileChanged out v
@@ -217,13 +223,14 @@ rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
     phony "cabalgen" $ need [_CABAL_FILE]
 
     _CABAL_FILE *> \_ -> do
-        alwaysRerun
-        Stdout _ <- cmd "./cabalgen.py" -- silence -- TODO OPTS (-prof)
+        alwaysRerun -- cabalgen only takes 130 ms
+        let profFlag = if prof then "-prof" else ""
+        Stdout _ <- cmd "./cabalgen.py" profFlag -- silence
         return ()
 
 
     -- Available packages (ghc-pkg list inside cabal-dev)
-    "_make/cabal-dev/pkglist" *> \out -> do
+    ghcPkgList *> \out -> do
         alwaysRerun
         Stdout src <- cmd "cabal-dev ghc-pkg list -v"
         writeFileChanged out src
@@ -231,17 +238,21 @@ rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
 
     -- cabal configure
 
-    phony "configure" $ need ["_make/project/setup-config"]
+    phony "configure" $ need [cabalConfig]
 
     -- Runs cabal-dev configure to obtain the setup-config, fixing all dependency versions.
-    "_make/project/setup-config" *> \setupConfig -> do
+    cabalConfig *> \setupConfig -> do
         -- We need extsrc ready for this so cabal configure can check the dependency versions.
-        need [_CABAL_FILE, "_make/extsrc/packages-install-stamp"] -- TODO phony extsrc bug
+        need [_CABAL_FILE, extsrc]
         -- Depend on GHC version and all package hashes.
         -- Note that this breaks if you try to cheat packages in around cabal!
-        need ["_make/ghc/version", "_make/cabal-dev/pkglist"]
+        need [ghcVersion, ghcPkgList]
 
-        Stdout _ <- cmd "cabal-dev configure --disable-library-profiling" -- silence -- TODO CONFIG_OPTS
+        let profFlag = if prof
+                         then "--enable-library-profiling --enable-executable-profiling"
+                         else "--disable-library-profiling --disable-executable-profiling"
+
+        Stdout _ <- cmd "cabal-dev configure" profFlag -- silence -- TODO CONFIG_OPTS
 
         -- cabal configure will always touch the setup-config.
         -- Copy if it to our own file if it has not changed such that it gets
@@ -256,12 +267,17 @@ rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
     -- Runs cabal-dev build and touches the build-stamp on success.
     "_make/project/build-stamp" *> \stamp -> do
         -- We track extsrc, the cabal config and all source files used by cabal
-        need ["_make/extsrc/packages-install-stamp", "_make/project/setup-config"] -- TODO phony extsrc bug
+        need [extsrc, cabalConfig]
         need =<< allFillesIn ["src", "executables", "bench"]
+
+        let ghcOpts = unwords [ "-j " ++ show jobs            -- jobs, with space for parmake
+                              , "-O" ++ show oLevel           -- optimization
+                              , if prof then "-auto" else ""  -- -auto for profiling
+                              ]
 
         -- TODO all these OPTS
         --   cabal-dev build $(PARMAKE) --ghc-options="$(BUILD_OPTS) $(OPTS)" -j$(JOBS) $(CABAL_OPTS)
-        () <- cmd "cabal-dev build" "--with-ghc=ghc-parmake" ["--ghc-options=-j " ++ show jobs ++ " -O" ++ show oLevel] ("lib:" ++ _CABAL_NAME)
+        () <- cmd "cabal-dev build" "--with-ghc=ghc-parmake"["--ghc-options=" ++ ghcOpts] ("lib:" ++ _CABAL_NAME)
 
         writeFile' stamp ""
 
@@ -271,8 +287,15 @@ rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
     -- Tags (hasktags)
     phony "tags" $ need _TAGS_FILES
     _TAGS_FILES *>> \_ -> do
-        need =<< getDirectoryFiles "" ["//*.hs", dropTrailingPathSeparator _PACKAGES_DIR ++ "//*.hs"]
+        need =<< getDirectoryFiles "" ["//*.hs", dropTrailingPathSeparator _PACKAGES_DIR ++ "//*.hs"] -- to align with _TAGS_SCAN_DIRS
         cmd (Cwd _TAGS_ROOT) $ "hasktags --extendedctag " ++ _TAGS_SCAN_DIRS
+
+    -- Cross references (hscope)
+    phony "hscope" $ need ["hscope.out"]
+    "hscope.out" *> \_ -> do
+        files <- getDirectoryFilesPrefixed "." ["//*.hs", dropTrailingPathSeparator _PACKAGES_DIR ++ "//*.hs"]
+        need files
+        cmd $ "hscope --build " ++ unwords files
 
 
     -- * EXTSRC SECTION
@@ -280,11 +303,11 @@ rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
     -- extsrc (external packages, available as source in the file system)
 
     -- Inspired by https://github.com/ndmitchell/shake/issues/38
-    phony "extsrc" $ need ["_make/extsrc/packages-install-stamp"]
+    phony "extsrc" $ need [extsrc]
 
     -- Installs all cabal packages in _PACKAGES_DIR that have been changed.
     -- Time stamp file gets touched if something was installed.
-    "_make/extsrc/packages-install-stamp" *> \stamp -> do
+    extsrc *> \stamp -> do
         -- Discover packages
         packages <- getDirectoryDirs _PACKAGES_DIR
 
@@ -294,6 +317,13 @@ rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
             -- Use the non-shake version here to not require the .rebuild to
             -- exist in shake's lint (we create and delete it in one rule run).
             liftIO . IO.doesFileExist $ "_make/extsrc" </> p <.> "rebuild"
+
+        -- Installing only the package(s) with changed files will not make other
+        -- extsrc packages notice such changes. But it is fast. Warn for that.
+        when (length toInstall /= length packages) $
+            putQuiet . red $ "This is a selective extsrc install. " ++
+                             "It will not detect intra-extsrc depedencies. " ++
+                             "Re-run with `-B extsrc` if other extsrc packages depend on your change."
 
         -- Build/install packages
         liftIO . putStrLn . unlines $ ["Building with cabal:"] ++ map ("  - " ++) toInstall
@@ -335,7 +365,6 @@ rules targets buildOptions@BuildOptions{ jobs, oLevel } = do
                                  , _CABAL_FILE            -- remove ./cabalgen.py generated cabal file
                                  , "gen-executables//*" ] -- remove ./cabalgen.py executable stubs
         -- TODO
-        -- cmd "rm -f .last_opt_level"
         -- cmd "make -C ../../web clean"
         liftIO $ removeFiles "." ["_make/project//*"]
 
